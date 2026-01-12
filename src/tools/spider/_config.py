@@ -24,25 +24,22 @@ ENDPOINTS = {
 
 # Default parameters for all requests
 # Note: wait_for removed - Spider default (500ms network idle) is sufficient for most pages
+# Note: proxy disabled for cost savings - stealth + proxy doesn't affect base file_cost
 DEFAULT_PARAMS = {
     "return_format": "markdown",
     "readability": True,
     "request": "smart",
+    "stealth": False,           # Off for cost savings
     "cache": True,
     "max_credits_allowed": 20,  # Cap per run at $0.002
     "depth": 2,                 # Shallow crawl default
-    "proxy": "residential",     # 1.2x cost, better success
+    # "proxy": "residential",   # Disabled - no proxy for cost savings
     "metadata": True,
     "block_ads": True,
     "block_analytics": True,
-    "filter_main_only": True,
     # Performance optimizations - don't load unnecessary assets
     "block_images": True,
     "block_stylesheets": True,
-    "filter_images": True,
-    "filter_output_images": True,
-    "filter_svg": True,
-    "filter_output_svg": True,
     "clean_html": True,
 }
 
@@ -131,3 +128,22 @@ def merge_params(custom_params: dict = None, base: dict = None) -> dict:
         base.update(custom_params)
 
     return base
+
+
+# =============================================================================
+# Post-processing utilities
+# =============================================================================
+
+import re
+
+def strip_markdown_images(content: str) -> str:
+    """
+    Remove markdown image syntax ![alt](url) from content.
+
+    Use this in post-processing since filter_output_images only works
+    with filter_main_only enabled, which can strip too much on some sites.
+    """
+    if not content:
+        return content
+    pattern = r'!\[[^\]]*\]\([^)]+\)'
+    return re.sub(pattern, '', content)
