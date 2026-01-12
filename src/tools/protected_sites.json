@@ -1,0 +1,262 @@
+{
+  "infinitepossibilities.ai": {
+    "failures": 2,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "middleground.com": {
+    "failures": 3,
+    "reasons": [
+      "error"
+    ],
+    "learned": true
+  },
+  "sequoiacap.com": {
+    "failures": 3,
+    "reasons": [
+      "content_too_short"
+    ],
+    "learned": true
+  },
+  "accel.com": {
+    "failures": 1,
+    "reasons": [
+      "content_too_short"
+    ],
+    "learned": false
+  },
+  "rockwoodequity.com": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "fuelonline.com": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "keomarketing.com": {
+    "failures": 1,
+    "reasons": [
+      "content_too_short"
+    ],
+    "learned": false
+  },
+  "adam darson lawpromo.com": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "arthur jones lawpromo.com": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "mongoosemedia.us": {
+    "failures": 1,
+    "reasons": [
+      "content_too_short"
+    ],
+    "learned": false
+  },
+  "zaphyrpro.com": {
+    "failures": 2,
+    "reasons": [
+      "content_too_short",
+      "error"
+    ],
+    "learned": false
+  },
+  "responsory.com": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "sourceday.com": {
+    "failures": 2,
+    "reasons": [
+      "error",
+      "content_too_short"
+    ],
+    "learned": false
+  },
+  "tempus.com": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "careers.getorbital.com": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "listenlabs.ai": {
+    "failures": 46,
+    "reasons": [
+      "error"
+    ],
+    "learned": true
+  },
+  "openrouter.ai": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "optimhire.com": {
+    "failures": 53,
+    "reasons": [
+      "content_too_short",
+      "error"
+    ],
+    "learned": true
+  },
+  "div-idy.com": {
+    "failures": 25,
+    "reasons": [
+      "error",
+      "content_too_short"
+    ],
+    "learned": true
+  },
+  "lmarena.ai": {
+    "failures": 22,
+    "reasons": [
+      "error"
+    ],
+    "learned": true
+  },
+  "traba.work": {
+    "failures": 38,
+    "reasons": [
+      "error",
+      "content_too_short"
+    ],
+    "learned": true
+  },
+  "jobs.ashbyhq.com": {
+    "failures": 41,
+    "reasons": [
+      "content_too_short",
+      "error"
+    ],
+    "learned": true
+  },
+  "linkedin.com": {
+    "failures": 11,
+    "reasons": [
+      "content_too_short",
+      "error"
+    ],
+    "learned": true
+  },
+  "jobs.a16z.com": {
+    "failures": 2,
+    "reasons": [
+      "content_too_short",
+      "error"
+    ],
+    "learned": false
+  },
+  "vivodyne.com": {
+    "failures": 45,
+    "reasons": [
+      "error"
+    ],
+    "learned": true
+  },
+  "job-boards.greenhouse.io": {
+    "failures": 5,
+    "reasons": [
+      "error"
+    ],
+    "learned": true
+  },
+  "gradient-labs.ai": {
+    "failures": 38,
+    "reasons": [
+      "error"
+    ],
+    "learned": true
+  },
+  "consider.com": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "neysa.ai": {
+    "failures": 24,
+    "reasons": [
+      "error"
+    ],
+    "learned": true
+  },
+  "joinblossomhealth.com": {
+    "failures": 28,
+    "reasons": [
+      "error"
+    ],
+    "learned": true
+  },
+  "skywork.ai": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "medium.com": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "glassdoor.com": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "simplify.jobs": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  },
+  "job-boards.eu.greenhouse.io": {
+    "failures": 1,
+    "reasons": [
+      "error"
+    ],
+    "learned": false
+  }
+}
