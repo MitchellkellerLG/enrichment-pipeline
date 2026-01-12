@@ -32,6 +32,7 @@ import pandas as pd
 from asyncio import Semaphore
 from pathlib import Path
 from datetime import datetime
+from threading import Lock
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -68,24 +69,164 @@ PROVIDER_LIMITS = {
 
 
 # =============================================================================
-# Provider Semaphores for Rate Limiting
+# Adaptive Rate Limiter
 # =============================================================================
 
-class ProviderSemaphores:
-    """Manage per-provider concurrency limits using asyncio semaphores."""
+class AdaptiveRateLimiter:
+    """
+    Adaptive rate limiter that discovers provider limits during real runs.
 
-    def __init__(self):
-        self.semaphores = {p: Semaphore(limit) for p, limit in PROVIDER_LIMITS.items()}
+    Starts conservative, ramps up on success, backs off on rate limit.
+    Persists discovered limits to state store.
+    """
+
+    # Default starting limits (conservative)
+    DEFAULT_LIMITS = {
+        "openrouter": 20,
+        "spider": 15,
+        "serper": 20,
+        "mx": 50,
+        "webhook": 10,
+    }
+
+    # Maximum limits to try
+    MAX_LIMITS = {
+        "openrouter": 100,
+        "spider": 50,
+        "serper": 80,
+        "mx": 200,
+        "webhook": 20,
+    }
+
+    def __init__(self, state_store=None, discover_mode: bool = False):
+        self.state_store = state_store
+        self.discover_mode = discover_mode
+        self.lock = Lock()
+
+        # Current state per provider
+        self.providers = {}
+        for provider in self.DEFAULT_LIMITS:
+            # Try to load persisted limit
+            stored = state_store.get_rate_limit(provider) if state_store else None
+
+            self.providers[provider] = {
+                "current_limit": stored["current_limit"] if stored else self.DEFAULT_LIMITS[provider],
+                "discovered_limit": stored["discovered_limit"] if stored else None,
+                "semaphore": asyncio.Semaphore(stored["current_limit"] if stored else self.DEFAULT_LIMITS[provider]),
+                "success_streak": 0,
+                "rate_limit_hits": 0,
+                "active_count": 0,
+            }
 
     async def acquire(self, provider: str):
-        """Acquire semaphore for a provider. Blocks if at limit."""
-        if provider in self.semaphores:
-            await self.semaphores[provider].acquire()
+        """Acquire a slot for the provider."""
+        prov = self.providers.get(provider)
+        if not prov:
+            return
+        await prov["semaphore"].acquire()
+        with self.lock:
+            prov["active_count"] += 1
 
     def release(self, provider: str):
-        """Release semaphore for a provider."""
-        if provider in self.semaphores:
-            self.semaphores[provider].release()
+        """Release a slot for the provider."""
+        prov = self.providers.get(provider)
+        if not prov:
+            return
+        prov["semaphore"].release()
+        with self.lock:
+            prov["active_count"] -= 1
+
+    def on_success(self, provider: str):
+        """Called when a request succeeds. Ramps up in discover mode."""
+        if not self.discover_mode:
+            return
+
+        prov = self.providers.get(provider)
+        if not prov:
+            return
+
+        with self.lock:
+            prov["success_streak"] += 1
+
+            # Ramp up every 20 successes
+            if prov["success_streak"] >= 20:
+                max_limit = self.MAX_LIMITS.get(provider, 100)
+                if prov["current_limit"] < max_limit:
+                    new_limit = min(prov["current_limit"] + 5, max_limit)
+                    self._resize_semaphore(provider, new_limit)
+                    print(f"  [RATE] {provider}: ramping up to {new_limit} concurrent")
+                prov["success_streak"] = 0
+
+    def on_rate_limit(self, provider: str):
+        """Called when a rate limit is hit. Backs off and records limit."""
+        prov = self.providers.get(provider)
+        if not prov:
+            return
+
+        with self.lock:
+            prov["rate_limit_hits"] += 1
+            prov["discovered_limit"] = prov["current_limit"]
+            prov["success_streak"] = 0
+
+            # Back off 30%
+            new_limit = max(5, int(prov["current_limit"] * 0.7))
+            self._resize_semaphore(provider, new_limit)
+            print(f"  [RATE] {provider}: rate limit hit! backing off to {new_limit} concurrent")
+
+            # Persist to state store
+            if self.state_store:
+                self.state_store.save_rate_limit(
+                    provider,
+                    prov["discovered_limit"],
+                    new_limit,
+                    hit_count=1
+                )
+
+    def _resize_semaphore(self, provider: str, new_limit: int):
+        """Resize semaphore (can only increase, not decrease mid-run)."""
+        prov = self.providers.get(provider)
+        if not prov:
+            return
+
+        old_limit = prov["current_limit"]
+        prov["current_limit"] = new_limit
+
+        # Replace semaphore with new limit
+        # Note: This is safe because we're not shrinking during active use
+        if new_limit > old_limit:
+            # Add more permits
+            for _ in range(new_limit - old_limit):
+                prov["semaphore"].release()
+
+    def get_stats(self) -> dict:
+        """Get current stats for all providers."""
+        stats = {}
+        for provider, prov in self.providers.items():
+            stats[provider] = {
+                "current_limit": prov["current_limit"],
+                "discovered_limit": prov["discovered_limit"],
+                "rate_limit_hits": prov["rate_limit_hits"],
+                "active": prov["active_count"]
+            }
+        return stats
+
+    def persist_all(self):
+        """Persist all discovered limits to state store."""
+        if not self.state_store:
+            return
+
+        for provider, prov in self.providers.items():
+            if prov["discovered_limit"] or prov["rate_limit_hits"] > 0:
+                self.state_store.save_rate_limit(
+                    provider,
+                    prov["discovered_limit"] or prov["current_limit"],
+                    prov["current_limit"],
+                    hit_count=prov["rate_limit_hits"]
+                )
+
+
+# Keep ProviderSemaphores as alias for backward compatibility
+ProviderSemaphores = AdaptiveRateLimiter
 
 
 # =============================================================================
@@ -195,72 +336,86 @@ def score_news_result(result: dict) -> dict:
 # =============================================================================
 
 def build_webhook_record(company_result: dict, run_id: str) -> dict:
-    """Transform a single company result into a Clay-compatible record."""
+    """Transform a single company result into a webhook record with nested objects."""
     record = {
         "run_id": run_id,
         "company_name": company_result.get("company_name"),
         "website": company_result.get("website"),
         "processed_at": datetime.now().isoformat(),
-        # ICP fields
-        "ai_is_qualified": None,
-        "ai_qualification_tier": "NEEDS_REVIEW",
-        "ai_confidence": None,
-        "ai_what_they_do": None,
-        "ai_who_they_serve": None,
-        "ai_three_sentence_summary": None,
-        "ai_primary_industry": None,
-        "ai_services_list": None,
-        # Hiring fields
-        "ai_hiring_intensity": None,
-        "ai_is_hiring": None,
-        "ai_open_positions_count": None,
-        "ai_careers_url": None,
-        "ai_linkedin_url": None,
-        "ai_all_job_titles": None,
-        # News fields
-        "ai_has_recent_news": None,
-        "ai_has_funding_news": None,
-        "ai_outreach_timing": None,
-        "ai_funding_amount": None,
-        "ai_funding_round_type": None,
+
+        # Nested objects - populated below if data exists
+        "mx": None,
+        "icp": None,
+        "careers": None,
+        "news": None,
     }
 
-    # Extract ICP data
+    # Populate mx object
+    mx_data = company_result.get("mx", {})
+    if mx_data and "result" in mx_data:
+        mx = mx_data["result"]
+        record["mx"] = {
+            "valid": mx.get("mx_valid", False),
+            "records": mx.get("mx_records", []),
+            "domain": mx.get("domain")
+        }
+
+    # Populate icp object
     icp_data = company_result.get("icp", {})
     if icp_data and "result" in icp_data:
         icp = icp_data["result"]
-        record["ai_is_qualified"] = icp.get("is_b2b")
-        record["ai_confidence"] = icp.get("confidence")
-        record["ai_what_they_do"] = icp.get("what_they_do")
-        record["ai_who_they_serve"] = icp.get("who_they_serve")
-        record["ai_three_sentence_summary"] = icp.get("three_sentence_summary")
-        record["ai_primary_industry"] = icp.get("primary_industry")
-        record["ai_services_list"] = json.dumps(icp.get("services_list", []))
-        if icp.get("is_b2b") is True:
-            record["ai_qualification_tier"] = "QUALIFIED"
-        elif icp.get("is_b2b") is False:
-            record["ai_qualification_tier"] = "DISQUALIFIED"
+        is_b2b = icp.get("is_b2b")
+        if is_b2b is True:
+            tier = "QUALIFIED"
+        elif is_b2b is False:
+            tier = "DISQUALIFIED"
+        else:
+            tier = "NEEDS_REVIEW"
 
-    # Extract Careers data
+        record["icp"] = {
+            "is_qualified": is_b2b,
+            "qualification_tier": tier,
+            "confidence": icp.get("confidence"),
+            "what_they_do": icp.get("what_they_do"),
+            "who_they_serve": icp.get("who_they_serve"),
+            "summary": icp.get("three_sentence_summary"),
+            "primary_industry": icp.get("primary_industry"),
+            "services_list": icp.get("services_list", []),
+            "industries_served": icp.get("industries_served", []),
+            "buyer_personas": icp.get("buyer_personas", []),
+            "problems_solved": icp.get("problems_they_solve", []),
+            "disqualify_reason": icp.get("disqualify_reason")
+        }
+
+    # Populate careers object
     careers_data = company_result.get("careers", {})
     if careers_data and "result" in careers_data:
         careers = careers_data["result"]
-        record["ai_hiring_intensity"] = careers.get("hiring_intensity")
-        record["ai_is_hiring"] = careers.get("is_hiring")
-        record["ai_open_positions_count"] = careers.get("open_positions_count")
-        record["ai_careers_url"] = careers.get("careers_url")
-        record["ai_linkedin_url"] = careers.get("linkedin_url")
-        record["ai_all_job_titles"] = json.dumps(careers.get("all_job_titles", []))
+        record["careers"] = {
+            "is_hiring": careers.get("is_hiring"),
+            "hiring_intensity": careers.get("hiring_intensity"),
+            "open_positions_count": careers.get("open_positions_count"),
+            "careers_url": careers.get("careers_url"),
+            "linkedin_url": careers.get("linkedin_url"),
+            "job_titles": careers.get("all_job_titles", []),
+            "matched_roles": careers.get("matched_roles", [])
+        }
 
-    # Extract News data
+    # Populate news object
     news_data = company_result.get("news", {})
     if news_data and "result" in news_data:
         news = news_data["result"]
-        record["ai_has_recent_news"] = news.get("has_recent_news")
-        record["ai_has_funding_news"] = news.get("has_funding_news")
-        record["ai_outreach_timing"] = news.get("outreach_timing")
-        record["ai_funding_amount"] = news.get("funding_amount")
-        record["ai_funding_round_type"] = news.get("funding_round_type")
+        record["news"] = {
+            "has_recent_news": news.get("has_recent_news"),
+            "outreach_timing": news.get("outreach_timing"),
+            "funding": {
+                "has_funding": news.get("has_funding_news"),
+                "round_type": news.get("funding_round_type"),
+                "amount": news.get("funding_amount"),
+                "investors": news.get("funding_investors", [])
+            },
+            "recent_announcements": news.get("recent_announcements", [])
+        }
 
     return record
 
@@ -271,75 +426,89 @@ def build_webhook_record_from_state(
     run_id: str,
     company_key: str
 ) -> dict:
-    """Build webhook record from state store data."""
+    """Build webhook record from state store data with nested objects."""
     record = {
         "run_id": run_id,
         "company_name": company.get("company_name"),
         "website": company.get("website"),
         "processed_at": datetime.now().isoformat(),
-        # ICP fields
-        "ai_is_qualified": None,
-        "ai_qualification_tier": "NEEDS_REVIEW",
-        "ai_confidence": None,
-        "ai_what_they_do": None,
-        "ai_who_they_serve": None,
-        "ai_three_sentence_summary": None,
-        "ai_primary_industry": None,
-        "ai_services_list": None,
-        # Hiring fields
-        "ai_hiring_intensity": None,
-        "ai_is_hiring": None,
-        "ai_open_positions_count": None,
-        "ai_careers_url": None,
-        "ai_linkedin_url": None,
-        "ai_all_job_titles": None,
-        # News fields
-        "ai_has_recent_news": None,
-        "ai_has_funding_news": None,
-        "ai_outreach_timing": None,
-        "ai_funding_amount": None,
-        "ai_funding_round_type": None,
+
+        # Nested objects - populated below if data exists
+        "mx": None,
+        "icp": None,
+        "careers": None,
+        "news": None,
     }
 
     # Get all node states
     node_states = state_store.get_all_node_states(run_id, company_key)
 
-    # Extract ICP data
+    # Populate mx object
+    mx_state = node_states.get("mx_check", {})
+    if mx_state and mx_state.get("output"):
+        mx = mx_state["output"]
+        record["mx"] = {
+            "valid": mx.get("mx_valid", False),
+            "records": mx.get("mx_records", []),
+            "domain": mx.get("domain")
+        }
+
+    # Populate icp object
     icp_state = node_states.get("icp_check", {})
     if icp_state and icp_state.get("output"):
         icp = icp_state["output"]
-        record["ai_is_qualified"] = icp.get("is_b2b")
-        record["ai_confidence"] = icp.get("confidence")
-        record["ai_what_they_do"] = icp.get("what_they_do")
-        record["ai_who_they_serve"] = icp.get("who_they_serve")
-        record["ai_three_sentence_summary"] = icp.get("three_sentence_summary")
-        record["ai_primary_industry"] = icp.get("primary_industry")
-        record["ai_services_list"] = json.dumps(icp.get("services_list", []))
-        if icp.get("is_b2b") is True:
-            record["ai_qualification_tier"] = "QUALIFIED"
-        elif icp.get("is_b2b") is False:
-            record["ai_qualification_tier"] = "DISQUALIFIED"
+        is_b2b = icp.get("is_b2b")
+        if is_b2b is True:
+            tier = "QUALIFIED"
+        elif is_b2b is False:
+            tier = "DISQUALIFIED"
+        else:
+            tier = "NEEDS_REVIEW"
 
-    # Extract Careers data
+        record["icp"] = {
+            "is_qualified": is_b2b,
+            "qualification_tier": tier,
+            "confidence": icp.get("confidence"),
+            "what_they_do": icp.get("what_they_do"),
+            "who_they_serve": icp.get("who_they_serve"),
+            "summary": icp.get("three_sentence_summary"),
+            "primary_industry": icp.get("primary_industry"),
+            "services_list": icp.get("services_list", []),
+            "industries_served": icp.get("industries_served", []),
+            "buyer_personas": icp.get("buyer_personas", []),
+            "problems_solved": icp.get("problems_they_solve", []),
+            "disqualify_reason": icp.get("disqualify_reason")
+        }
+
+    # Populate careers object
     careers_state = node_states.get("careers", {})
     if careers_state and careers_state.get("output"):
         careers = careers_state["output"]
-        record["ai_hiring_intensity"] = careers.get("hiring_intensity")
-        record["ai_is_hiring"] = careers.get("is_hiring")
-        record["ai_open_positions_count"] = careers.get("open_positions_count")
-        record["ai_careers_url"] = careers.get("careers_url")
-        record["ai_linkedin_url"] = careers.get("linkedin_url")
-        record["ai_all_job_titles"] = json.dumps(careers.get("all_job_titles", []))
+        record["careers"] = {
+            "is_hiring": careers.get("is_hiring"),
+            "hiring_intensity": careers.get("hiring_intensity"),
+            "open_positions_count": careers.get("open_positions_count"),
+            "careers_url": careers.get("careers_url"),
+            "linkedin_url": careers.get("linkedin_url"),
+            "job_titles": careers.get("all_job_titles", []),
+            "matched_roles": careers.get("matched_roles", [])
+        }
 
-    # Extract News data
+    # Populate news object
     news_state = node_states.get("news", {})
     if news_state and news_state.get("output"):
         news = news_state["output"]
-        record["ai_has_recent_news"] = news.get("has_recent_news")
-        record["ai_has_funding_news"] = news.get("has_funding_news")
-        record["ai_outreach_timing"] = news.get("outreach_timing")
-        record["ai_funding_amount"] = news.get("funding_amount")
-        record["ai_funding_round_type"] = news.get("funding_round_type")
+        record["news"] = {
+            "has_recent_news": news.get("has_recent_news"),
+            "outreach_timing": news.get("outreach_timing"),
+            "funding": {
+                "has_funding": news.get("has_funding_news"),
+                "round_type": news.get("funding_round_type"),
+                "amount": news.get("funding_amount"),
+                "investors": news.get("funding_investors", [])
+            },
+            "recent_announcements": news.get("recent_announcements", [])
+        }
 
     return record
 
@@ -519,8 +688,20 @@ async def run_dag_scheduler(
             state_store.update_node(run_id, company_key, node_name, "running")
             result = await run_node_async(node_name, company)
 
+            # Check for rate limit error (429)
+            error = result.get("error", "")
+            if "429" in str(error) or "rate limit" in str(error).lower():
+                semaphores.on_rate_limit(node.provider)
+                state_store.update_node(run_id, company_key, node_name, "failed", {"error": str(error)})
+                if verbose:
+                    print(f"  [{name}] {node_name}: rate limited - {error}")
+                return
+
             cost = result.get("cost_usd", 0)
             state_store.update_node(run_id, company_key, node_name, "completed", result, cost)
+
+            # Signal success to rate limiter
+            semaphores.on_success(node.provider)
 
             # Cache the result
             cache_store.set(node_name, website, result, cost)
@@ -545,6 +726,10 @@ async def run_dag_scheduler(
                 print(f"  [{name}] {node_name}: completed")
 
         except Exception as e:
+            # Check if exception indicates rate limiting
+            error_str = str(e)
+            if "429" in error_str or "rate limit" in error_str.lower():
+                semaphores.on_rate_limit(node.provider)
             state_store.update_node(run_id, company_key, node_name, "failed", {"error": str(e)})
             if verbose:
                 print(f"  [{name}] {node_name}: failed - {e}")
@@ -554,10 +739,14 @@ async def run_dag_scheduler(
     # Run all companies concurrently
     await asyncio.gather(*[process_company(c, i) for i, c in enumerate(companies)])
 
+    # Persist discovered rate limits
+    semaphores.persist_all()
+
     # Get final stats
     elapsed = time.time() - start_time
     stats = state_store.get_run_stats(run_id)
     cache_stats = cache_store.get_stats()
+    rate_limit_stats = semaphores.get_stats()
 
     # Final report
     print(f"\n{'='*60}")
@@ -602,6 +791,8 @@ if __name__ == "__main__":
     parser.add_argument("--state-db", default=".state/pipeline.db", help="Path to state database")
     parser.add_argument("--cache-db", default=".state/cache.db", help="Path to cache database")
     parser.add_argument("--output", "-o", help="Save results to JSON file")
+    parser.add_argument("--discover-limits", action="store_true",
+                        help="Enable adaptive rate limit discovery (ramps up on success, backs off on 429)")
 
     args = parser.parse_args()
 
@@ -633,7 +824,10 @@ if __name__ == "__main__":
     # Initialize stores
     state_store = StateStore(args.state_db)
     cache_store = CacheStore(args.cache_db)
-    semaphores = ProviderSemaphores()
+    semaphores = AdaptiveRateLimiter(state_store=state_store, discover_mode=args.discover_limits)
+
+    if args.discover_limits:
+        print("Rate limit discovery mode ENABLED - will ramp up on success, back off on 429")
 
     # Determine run_id
     if args.resume:

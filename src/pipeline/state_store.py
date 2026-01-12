@@ -115,6 +115,18 @@ class StateStore:
                     ON company_state(run_id, overall_status)
                 """)
 
+                # Rate limits table - tracks discovered provider rate limits
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS rate_limits (
+                        provider TEXT PRIMARY KEY,
+                        discovered_limit INTEGER,
+                        current_limit INTEGER,
+                        last_rate_limit_at TEXT,
+                        total_rate_limit_hits INTEGER DEFAULT 0,
+                        updated_at TEXT
+                    )
+                """)
+
                 conn.commit()
             finally:
                 conn.close()
@@ -598,5 +610,50 @@ class StateStore:
                         'updated_at': row['updated_at']
                     }
                 return results
+            finally:
+                conn.close()
+
+    def get_rate_limit(self, provider: str) -> Optional[dict]:
+        """Get stored rate limit for a provider."""
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM rate_limits WHERE provider = ?",
+                    (provider,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        "provider": row[0],
+                        "discovered_limit": row[1],
+                        "current_limit": row[2],
+                        "last_rate_limit_at": row[3],
+                        "total_rate_limit_hits": row[4],
+                        "updated_at": row[5]
+                    }
+                return None
+            finally:
+                conn.close()
+
+    def save_rate_limit(self, provider: str, discovered_limit: int, current_limit: int, hit_count: int = 0):
+        """Save discovered rate limit for a provider."""
+        now = self._now_iso()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO rate_limits (provider, discovered_limit, current_limit, last_rate_limit_at, total_rate_limit_hits, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(provider) DO UPDATE SET
+                        discovered_limit = excluded.discovered_limit,
+                        current_limit = excluded.current_limit,
+                        last_rate_limit_at = excluded.last_rate_limit_at,
+                        total_rate_limit_hits = total_rate_limit_hits + excluded.total_rate_limit_hits,
+                        updated_at = excluded.updated_at
+                """, (provider, discovered_limit, current_limit, now, hit_count, now))
+                conn.commit()
             finally:
                 conn.close()
