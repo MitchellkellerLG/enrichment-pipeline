@@ -80,29 +80,55 @@ careers = run_careers_linkedin(company, website)
 news = run_news_intel(company, website)
 ```
 
-### Batch Processing
+### Batch Processing (Testing)
 
 ```bash
-# Run anneal test on 25 companies
+# Run anneal test on 25 companies (validates accuracy before production)
 python -m src.pipeline.anneal_harness --sample 25 --parallel 10
 
-# Run from CSV file
-python -m src.pipeline.anneal_harness --file companies.csv --parallel 30
+# Run from CSV file with batch webhook push
+python -m src.pipeline.anneal_harness --file companies.csv --parallel 30 --push-webhook
+```
 
-# Push results to Clay webhook
-python -m src.pipeline.anneal_harness --file companies.csv --push-webhook
+### Production Run (Streaming Webhook)
+
+For production, use `production_run.py` which pushes each company to the webhook **immediately** after completion (1 record per webhook call):
+
+```bash
+# Test with 50 company sample first (recommended)
+python -m src.pipeline.production_run --file companies.csv --sample 50 --parallel 10
+
+# Dry run (no webhook push, just see results)
+python -m src.pipeline.production_run --file companies.csv --sample 50 --dry-run
+
+# Full production run
+python -m src.pipeline.production_run --file companies.csv --parallel 30
+
+# Save results to JSON
+python -m src.pipeline.production_run --file companies.csv --output results.json
 ```
 
 ### CLI Options
+
+**anneal_harness.py** (testing/validation):
 
 ```
 --sample N       Number of test companies (default: 9)
 --file FILE      CSV with company_name,website columns
 --parallel N     Concurrent companies (default: 1, max recommended: 30)
---verbose        Show detailed output
---no-retry       Disable retry logic
---push-webhook   Push to Clay webhook after completion
+--push-webhook   Push ALL results to webhook at end
 --force-push     Push even if accuracy gate fails
+```
+
+**production_run.py** (production with streaming):
+
+```
+--file FILE      CSV with company_name,website columns (required)
+--sample N       Only process first N companies (for testing)
+--parallel N     Concurrent workers (default: 10, max: 30)
+--webhook URL    Override webhook URL from env
+--dry-run        Skip webhook pushes
+--output FILE    Save results to JSON
 ```
 
 ## Prompt Versioning
