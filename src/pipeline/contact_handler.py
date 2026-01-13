@@ -3,10 +3,13 @@ Contact List Handler
 
 Handles contact lists (multiple contacts per company) by:
 1. Detecting if input is a contact list
-2. Deduplicating by company
-3. Enriching unique companies
-4. Joining enrichment back to contacts
-5. Pushing webhook per contact
+2. Cloning list (READ-ONLY original)
+3. Extracting unique companies
+4. Enriching unique companies only
+5. Joining enrichment back to ALL original contacts
+6. Pushing webhook per contact
+
+Key principle: Original contact list is READ-ONLY. We only ADD enrichment columns.
 """
 
 import pandas as pd
@@ -23,6 +26,47 @@ CONTACT_COLUMNS = [
     'contact_id', 'person_id', 'lead_id',
     'first_name', 'last_name'
 ]
+
+# Company column name variants (will be normalized to 'website')
+WEBSITE_COLUMN_VARIANTS = ['website', 'company_website', 'domain', 'url']
+COMPANY_NAME_VARIANTS = ['company_name', 'company', 'organization']
+
+
+def normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Normalize column names to standard format.
+
+    Maps variants like 'company_website' -> 'website' for consistent processing.
+
+    Args:
+        df: Input DataFrame
+
+    Returns:
+        Tuple of (normalized DataFrame, mapping dict of original -> normalized names)
+    """
+    df = df.copy()
+    mapping = {}
+
+    # Normalize website column
+    df_cols_lower = {c.lower(): c for c in df.columns}
+    for variant in WEBSITE_COLUMN_VARIANTS:
+        if variant in df_cols_lower:
+            original_col = df_cols_lower[variant]
+            if original_col != 'website':
+                df = df.rename(columns={original_col: 'website'})
+                mapping[original_col] = 'website'
+            break
+
+    # Normalize company_name column
+    for variant in COMPANY_NAME_VARIANTS:
+        if variant in df_cols_lower:
+            original_col = df_cols_lower[variant]
+            if original_col != 'company_name':
+                df = df.rename(columns={original_col: 'company_name'})
+                mapping[original_col] = 'company_name'
+            break
+
+    return df, mapping
 
 
 def detect_input_type(df: pd.DataFrame) -> str:
@@ -63,28 +107,42 @@ def extract_contact_columns(df: pd.DataFrame) -> list[str]:
     return found
 
 
-def dedupe_by_company(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def extract_unique_companies(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Extract unique companies from a contact list.
+    Extract unique companies from a contact list WITHOUT modifying original.
+
+    This is the key function that implements the clone -> dedupe -> enrich -> join pattern.
+    Original contact list is READ-ONLY. We add an index for later join-back.
 
     Args:
-        df: Contact list DataFrame with company_name and website columns
+        df: Contact list DataFrame (must have 'company_name' and 'website' columns)
 
     Returns:
         Tuple of (unique_companies_df, original_df_with_index)
-        - unique_companies_df has deduplicated company_name, website
-        - original_df has added _contact_index column for later join
+        - unique_companies_df: Deduplicated companies for enrichment (separate copy)
+        - original_df_with_index: Original list with _contact_index for join-back
     """
-    # Add index for later join
-    df = df.copy()
-    df['_contact_index'] = range(len(df))
+    # Preserve original with index for later join
+    original_with_index = df.copy()
+    original_with_index['_contact_index'] = range(len(original_with_index))
 
-    # Extract unique companies
-    unique_companies = df[['company_name', 'website']].drop_duplicates()
+    # Extract unique companies (separate copy - not modifying original)
+    # Use normalized 'website' column as key
+    company_cols = ['company_name', 'website']
+    unique_companies = df[company_cols].drop_duplicates().copy()
+
+    # Clean up website for key creation (remove http/https, trailing slashes)
+    unique_companies['_website_key'] = unique_companies['website'].apply(
+        lambda x: str(x).lower().replace('http://', '').replace('https://', '').rstrip('/') if pd.notna(x) else ''
+    )
 
     print(f"Contact list: {len(df)} contacts from {len(unique_companies)} unique companies")
 
-    return unique_companies, df
+    return unique_companies, original_with_index
+
+
+# Keep old name as alias for backward compatibility
+dedupe_by_company = extract_unique_companies
 
 
 def join_enrichment_to_contacts(
@@ -93,16 +151,26 @@ def join_enrichment_to_contacts(
     company_key_fn
 ) -> pd.DataFrame:
     """
-    Join enrichment results back to original contact list.
+    Join enrichment results back to ALL original contacts.
+
+    Uses website as primary join key. Every contact gets enrichment data
+    from their company. Multiple contacts from same company share identical
+    enrichment.
 
     Args:
-        contacts_df: Original contact DataFrame with _contact_index
+        contacts_df: Original contact DataFrame with _contact_index (READ-ONLY pattern)
         enrichment_data: Dict mapping company_key to enrichment result
         company_key_fn: Function to create company key from row
 
     Returns:
-        DataFrame with enrichment data merged in
+        DataFrame with same row count as input + enrichment data merged in
     """
+    # Create normalized website key for matching
+    contacts_df = contacts_df.copy()
+    contacts_df['_website_key'] = contacts_df['website'].apply(
+        lambda x: str(x).lower().replace('http://', '').replace('https://', '').rstrip('/') if pd.notna(x) else ''
+    )
+
     def get_enrichment(row):
         key = company_key_fn({
             'company_name': row.get('company_name', ''),
@@ -111,8 +179,12 @@ def join_enrichment_to_contacts(
         return enrichment_data.get(key, {})
 
     # Add enrichment as nested dict column
-    contacts_df = contacts_df.copy()
     contacts_df['_enrichment'] = contacts_df.apply(get_enrichment, axis=1)
+
+    # Verify row count preserved
+    original_count = len(contacts_df)
+    if original_count != len(contacts_df):
+        raise ValueError(f"Row count changed during join! Original: {original_count}, After: {len(contacts_df)}")
 
     return contacts_df
 
@@ -265,10 +337,20 @@ class ContactListProcessor:
         verbose: bool = False
     ) -> dict:
         """
-        Process a contact list: dedupe -> enrich -> join -> push.
+        Process a contact list: clone -> extract unique companies -> enrich -> join back -> push.
+
+        IMPORTANT: Original contact list is READ-ONLY. Output has SAME row count as input.
+
+        Flow:
+        1. Normalize column names (company_website -> website)
+        2. Clone original with index for later join
+        3. Extract unique companies (separate copy)
+        4. Enrich companies only (not per-contact)
+        5. Join enrichment back to ALL original contacts
+        6. Push webhook per contact (not per company)
 
         Args:
-            contacts_df: Input contact DataFrame
+            contacts_df: Input contact DataFrame (READ-ONLY)
             run_id: Pipeline run ID
             dag_scheduler_fn: The DAG scheduler function to call for company enrichment
             webhook_url: Webhook destination
@@ -282,38 +364,64 @@ class ContactListProcessor:
         print("CONTACT LIST PROCESSOR")
         print(f"{'='*60}")
 
-        # Step 1: Dedupe by company
-        unique_companies, contacts_with_index = dedupe_by_company(contacts_df)
+        original_count = len(contacts_df)
+        print(f"Original contact count: {original_count}")
+
+        # Step 1: Normalize column names
+        normalized_df, column_mapping = normalize_columns(contacts_df)
+        if column_mapping:
+            print(f"Normalized columns: {column_mapping}")
+
+        # Step 2: Extract unique companies (preserves original with index)
+        unique_companies, contacts_with_index = extract_unique_companies(normalized_df)
         companies = unique_companies.to_dict('records')
 
-        print(f"Enriching {len(companies)} unique companies...")
+        print(f"\nStep 1/4: Extracted {len(companies)} unique companies from {original_count} contacts")
+        print(f"Enriching companies only (not per-contact)...")
 
-        # Step 2: Enrich companies using DAG scheduler
+        # Step 3: Enrich companies using DAG scheduler
         await dag_scheduler_fn(
             companies=companies,
             run_id=run_id,
             state_store=self.state_store,
             cache_store=self.cache_store,
             semaphores=self.semaphores,
-            webhook_url=None,  # Don't push company webhooks
+            webhook_url=None,  # Don't push company webhooks - we push per contact
             dry_run=True,  # Don't push during enrichment
             verbose=verbose
         )
 
-        # Step 3: Collect enrichment data
+        print(f"\nStep 2/4: Company enrichment complete")
+
+        # Step 4: Collect enrichment data from state store
         enrichment_data = {}
         for company in companies:
             key = self.company_key_fn(company)
-            # Get enrichment from state store
             node_states = self.state_store.get_all_node_states(run_id, key)
             enrichment_data[key] = self._build_enrichment_dict(node_states)
 
-        # Step 4: Push per contact
-        print(f"\nPushing webhooks for {len(contacts_with_index)} contacts...")
+        # Step 5: Join enrichment back to ALL original contacts
+        contacts_with_enrichment = join_enrichment_to_contacts(
+            contacts_with_index,
+            enrichment_data,
+            self.company_key_fn
+        )
+
+        # Verify row count preserved
+        final_count = len(contacts_with_enrichment)
+        print(f"\nStep 3/4: Joined enrichment back to contacts")
+        print(f"  Original count: {original_count}")
+        print(f"  Final count:    {final_count}")
+        if final_count != original_count:
+            raise ValueError(f"Row count changed! Original: {original_count}, Final: {final_count}")
+        print(f"  ✓ Row count preserved")
+
+        # Step 6: Push webhook per contact (not per company)
+        print(f"\nStep 4/4: Pushing webhooks for {final_count} contacts...")
 
         webhook_semaphore = asyncio.Semaphore(10)  # Limit concurrent webhook calls
         push_stats = await push_contacts_to_webhook(
-            contacts_with_index,
+            contacts_with_enrichment,
             enrichment_data,
             self.company_key_fn,
             webhook_url,
@@ -327,16 +435,19 @@ class ContactListProcessor:
         print("CONTACT LIST COMPLETE")
         print(f"{'='*60}")
         print(f"Total Contacts:     {push_stats['total']}")
+        print(f"Companies Enriched: {len(companies)}")
         print(f"Webhooks Pushed:    {push_stats['pushed']}")
         print(f"Failed:             {push_stats['failed']}")
         print(f"Skipped (dry run):  {push_stats['skipped']}")
+        print(f"Row Count Check:    {original_count} → {final_count} ({'✓ PRESERVED' if original_count == final_count else '✗ CHANGED'})")
         print(f"{'='*60}")
 
         return {
             "contacts_total": push_stats['total'],
             "companies_enriched": len(companies),
             "webhooks_pushed": push_stats['pushed'],
-            "webhooks_failed": push_stats['failed']
+            "webhooks_failed": push_stats['failed'],
+            "row_count_preserved": original_count == final_count
         }
 
     def _build_enrichment_dict(self, node_states: dict) -> dict:

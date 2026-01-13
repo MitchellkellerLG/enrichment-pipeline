@@ -48,6 +48,13 @@ from src.pipeline.cache_store import CacheStore
 from src.pipeline.dag import NODES, get_ready_nodes, is_company_complete
 from src.pipeline.nodes.mx_check import run_mx_check
 
+# Import contact handler for contact list processing
+from src.pipeline.contact_handler import (
+    detect_input_type,
+    normalize_columns,
+    ContactListProcessor
+)
+
 # Import existing runners
 from src.pipeline.runners import run_icp_qual, run_careers_linkedin, run_news_intel
 
@@ -784,8 +791,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Run DAG-based production enrichment pipeline")
-    parser.add_argument("--file", "-f", required=True, help="CSV file with company_name,website columns")
-    parser.add_argument("--sample", "-s", type=int, help="Only process first N companies (for testing)")
+    parser.add_argument("--file", "-f", required=True, help="CSV file with company_name,website columns (or contact list)")
+    parser.add_argument("--sample", "-s", type=int, help="Only process first N rows (for testing)")
     parser.add_argument("--webhook", "-w", help="Override webhook URL from env")
     parser.add_argument("--dry-run", action="store_true", help="Skip webhook pushes")
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -795,33 +802,35 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", help="Save results to JSON file")
     parser.add_argument("--discover-limits", action="store_true",
                         help="Enable adaptive rate limit discovery (ramps up on success, backs off on 429)")
+    parser.add_argument("--force-company-mode", action="store_true",
+                        help="Force company list mode even if contact columns detected")
 
     args = parser.parse_args()
 
-    # Load companies from CSV
-    df = pd.read_csv(args.file)
+    # Load data from CSV
+    df = pd.read_csv(args.file, low_memory=False)
+    print(f"Loaded {len(df)} rows from {args.file}")
 
-    # Ensure required columns
+    # Detect input type: contact list or company list
+    input_type = detect_input_type(df)
+    if args.force_company_mode:
+        input_type = "company_list"
+
+    print(f"Detected input type: {input_type}")
+
+    # Normalize column names (company_website -> website, etc.)
+    df, column_mapping = normalize_columns(df)
+    if column_mapping:
+        print(f"Normalized columns: {column_mapping}")
+
+    # Validate required columns exist after normalization
     if "company_name" not in df.columns:
-        # Try common alternatives
-        if "Company Name" in df.columns:
-            df = df.rename(columns={"Company Name": "company_name"})
-        elif "name" in df.columns:
-            df = df.rename(columns={"name": "company_name"})
-        else:
-            print("ERROR: CSV must have 'company_name' column")
-            sys.exit(1)
+        print("ERROR: CSV must have 'company_name' column (or variant like 'company', 'organization')")
+        sys.exit(1)
 
     if "website" not in df.columns:
-        if "Website" in df.columns:
-            df = df.rename(columns={"Website": "website"})
-        elif "url" in df.columns:
-            df = df.rename(columns={"url": "website"})
-        else:
-            print("ERROR: CSV must have 'website' column")
-            sys.exit(1)
-
-    companies = df[["company_name", "website"]].to_dict("records")
+        print("ERROR: CSV must have 'website' column (or variant like 'company_website', 'domain', 'url')")
+        sys.exit(1)
 
     # Initialize stores
     state_store = StateStore(args.state_db)
@@ -834,20 +843,9 @@ if __name__ == "__main__":
     # Determine run_id
     if args.resume:
         run_id = args.resume
-        # Filter to resumable companies
-        resumable = state_store.get_resumable_companies(run_id)
-        resumable_keys = {c["company_key"] for c in resumable}
-
-        # Filter input companies to only those that are resumable
-        companies = [c for c in companies if make_company_key(c) in resumable_keys]
-        print(f"Resuming run {run_id} with {len(companies)} resumable companies")
+        print(f"Resuming run {run_id}")
     else:
         run_id = f"prod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    # Apply sample limit
-    if args.sample:
-        companies = companies[:args.sample]
-        print(f"Sampling first {args.sample} companies")
 
     # Get webhook URL
     webhook_url = args.webhook or CLAY_WEBHOOK
@@ -856,17 +854,68 @@ if __name__ == "__main__":
         print("         Running in dry-run mode.")
         args.dry_run = True
 
-    # Run the DAG scheduler
-    report = asyncio.run(run_dag_scheduler(
-        companies=companies,
-        run_id=run_id,
-        state_store=state_store,
-        cache_store=cache_store,
-        semaphores=semaphores,
-        webhook_url=webhook_url,
-        dry_run=args.dry_run,
-        verbose=args.verbose,
-    ))
+    # Apply sample limit
+    if args.sample:
+        df = df.head(args.sample)
+        print(f"Sampling first {args.sample} rows")
+
+    # ==========================================================================
+    # CONTACT LIST MODE: Preserve all contacts, enrich by company, join back
+    # ==========================================================================
+    if input_type == "contact_list":
+        print(f"\n{'='*60}")
+        print("CONTACT LIST MODE")
+        print(f"{'='*60}")
+        print(f"Total contacts:   {len(df)}")
+        print(f"Unique companies: {df[['company_name', 'website']].drop_duplicates().shape[0]}")
+        print(f"{'='*60}")
+
+        # Create contact list processor
+        processor = ContactListProcessor(
+            state_store=state_store,
+            cache_store=cache_store,
+            semaphores=semaphores,
+            company_key_fn=make_company_key
+        )
+
+        # Process contact list
+        report = asyncio.run(processor.process(
+            contacts_df=df,
+            run_id=run_id,
+            dag_scheduler_fn=run_dag_scheduler,
+            webhook_url=webhook_url,
+            dry_run=args.dry_run,
+            verbose=args.verbose
+        ))
+
+    # ==========================================================================
+    # COMPANY LIST MODE: Original behavior (one webhook per company)
+    # ==========================================================================
+    else:
+        print(f"\n{'='*60}")
+        print("COMPANY LIST MODE")
+        print(f"{'='*60}")
+
+        companies = df[["company_name", "website"]].to_dict("records")
+
+        # Handle resume
+        if args.resume:
+            resumable = state_store.get_resumable_companies(run_id)
+            resumable_keys = {c["company_key"] for c in resumable}
+            companies = [c for c in companies if make_company_key(c) in resumable_keys]
+            print(f"Resuming with {len(companies)} resumable companies")
+
+        # Run the DAG scheduler
+        report = asyncio.run(run_dag_scheduler(
+            companies=companies,
+            run_id=run_id,
+            state_store=state_store,
+            cache_store=cache_store,
+            semaphores=semaphores,
+            webhook_url=webhook_url,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+        ))
 
     # Save results
     if args.output:
