@@ -688,13 +688,15 @@ async def run_dag_scheduler(
             state_store.update_node(run_id, company_key, node_name, "running")
             result = await run_node_async(node_name, company)
 
-            # Check for rate limit error (429)
+            # Check for errors in result
             error = result.get("error", "")
-            if "429" in str(error) or "rate limit" in str(error).lower():
-                semaphores.on_rate_limit(node.provider)
+            if error:
+                # Check for rate limit error (429)
+                if "429" in str(error) or "rate limit" in str(error).lower():
+                    semaphores.on_rate_limit(node.provider)
                 state_store.update_node(run_id, company_key, node_name, "failed", {"error": str(error)})
                 if verbose:
-                    print(f"  [{name}] {node_name}: rate limited - {error}")
+                    print(f"  [{name}] {node_name}: failed - {error}")
                 return
 
             cost = result.get("cost_usd", 0)

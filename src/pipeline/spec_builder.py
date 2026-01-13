@@ -13,11 +13,7 @@ import json
 import sys
 from pathlib import Path
 
-# Add paths
-ENRICHMENT_AGENT_DIR = Path(__file__).parent.parent / ".claude/skills/enrichment/enrichment-agent/tools"
-sys.path.insert(0, str(ENRICHMENT_AGENT_DIR))
-
-from schema_definitions import (
+from src.schemas.definitions import (
     DEFAULT_ICP_SPEC,
     DEFAULT_HIRING_SPEC,
     DEFAULT_NEWS_SPEC,

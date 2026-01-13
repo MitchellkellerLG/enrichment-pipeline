@@ -128,9 +128,9 @@ def get_ready_nodes(
     ready_nodes: list[str] = []
 
     for node_name, node in NODES.items():
-        # Check current status - skip if already done or in progress
+        # Check current status - skip if already done, failed, or in progress
         current_status = state_store.get_node_status(company_key, node_name, run_id)
-        if current_status in ("completed", "skipped", "running"):
+        if current_status in ("completed", "skipped", "running", "failed"):
             continue
 
         # Check all dependencies are completed
@@ -177,12 +177,12 @@ def is_company_complete(
         run_id: Current pipeline run identifier
 
     Returns:
-        True if all nodes are in a terminal state (completed or skipped),
+        True if all nodes are in a terminal state (completed, skipped, or failed),
         False otherwise
     """
     for node_name in NODES:
         status = state_store.get_node_status(company_key, node_name, run_id)
-        if status not in ("completed", "skipped"):
+        if status not in ("completed", "skipped", "failed"):
             return False
     return True
 

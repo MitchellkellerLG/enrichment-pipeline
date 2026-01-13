@@ -594,7 +594,7 @@ def run_icp_qual(company_name: str, website: str, description: str = None, verbo
         use_retry: If True, use run_agent_with_retry for automatic retries on failure
     """
     from src.tools.call_llm_openrouter import run_agent, run_agent_with_retry
-    from schema_definitions import ICP_REQUIRED_KEYS
+    from src.schemas.definitions import ICP_REQUIRED_KEYS
 
     prompt = build_icp_qual_prompt(company_name, website, description)
 
@@ -650,7 +650,7 @@ def run_careers_linkedin(company_name: str, website: str, verbose: bool = False,
         use_retry: If True, use run_agent_with_retry for automatic retries on failure
     """
     from src.tools.call_llm_openrouter import run_agent, run_agent_with_retry
-    from schema_definitions import CAREERS_REQUIRED_KEYS
+    from src.schemas.definitions import CAREERS_REQUIRED_KEYS
 
     prompt = build_careers_linkedin_prompt(company_name, website)
 
@@ -704,7 +704,7 @@ def run_news_intel(company_name: str, website: str, verbose: bool = False, use_r
         use_retry: If True, use run_agent_with_retry for automatic retries on failure
     """
     from src.tools.call_llm_openrouter import run_agent, run_agent_with_retry
-    from schema_definitions import NEWS_REQUIRED_KEYS
+    from src.schemas.definitions import NEWS_REQUIRED_KEYS
 
     prompt = build_news_intel_prompt(company_name, website)
 
